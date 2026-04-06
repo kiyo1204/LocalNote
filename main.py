@@ -1,8 +1,5 @@
-import os, logging, json, shutil, gc, time, chromadb
-import streamlit as st
-
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import PyPDFDirectoryLoader
+from langchain_community.document_loaders import DirectoryLoader, PDFPlumberLoader
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_classic.chains import create_retrieval_chain, create_history_aware_retriever
@@ -10,6 +7,10 @@ from langchain_classic.chains.combine_documents import create_stuff_documents_ch
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage, AIMessage
+
+import os, logging, json, shutil, gc, time, chromadb
+import streamlit as st
+
 
 # 初期設定・ログ抑制
 DB_DIR = "./db"
@@ -43,7 +44,7 @@ def load_config():
     if os.path.exists(CONFIG_DIR):
         with open(CONFIG_DIR, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {"system_prompt": DEFAULT_PROMPT}
+    return DEFAULT_PROMPT
 
 # コンテキスト内学習用jsonの保存
 def save_config(config_data):
@@ -86,11 +87,15 @@ class RAGEngine:
 
     # PDFを読み込み、分割してベクトルデータベースを構築する
     def build_database(self, pdf_dir_path, target_db_path):
-        loader = PyPDFDirectoryLoader(pdf_dir_path)
+        loader = DirectoryLoader(
+            pdf_dir_path,
+            glob="**/*.pdf",
+            loader_cls=PDFPlumberLoader
+        )
         pages = loader.load()
         
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=300, # チャンクの最大文字数
+            chunk_size=800, # チャンクの最大文字数
             chunk_overlap=50, # チャンク間の重複させる文字数
             separators=["\n\n", "\n", "。", "、", " "] # 分割する文字の優先順位
         )
