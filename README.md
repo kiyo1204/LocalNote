@@ -7,7 +7,8 @@
 　このアプリを制作した理由は, LLMを使って何か作りたかったからと, 大学の講義資料などのあまり外部に出さないほうがいいファイルを扱える要点整理アプリが欲しかったからです.
 
 ## 💡動作画面
-*Coming Soon*
+- 論文(Attention is all you need)を要約した画面
+<img width="1884" height="894" alt="image" src="https://github.com/user-attachments/assets/ebeac9d0-6514-484b-8137-7c527861e2db" />
 
 ## ⛏️使用技術
 - **フロントエンド**: Streamlit
