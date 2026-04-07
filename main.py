@@ -7,6 +7,7 @@ from langchain_classic.chains.combine_documents import create_stuff_documents_ch
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.output_parsers import StrOutputParser
 
 import os, logging, json, shutil, gc, time, chromadb
 import streamlit as st
@@ -95,7 +96,7 @@ class RAGEngine:
         pages = loader.load()
         
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=800, # チャンクの最大文字数
+            chunk_size=600, # チャンクの最大文字数
             chunk_overlap=50, # チャンク間の重複させる文字数
             separators=["\n\n", "\n", "。", "、", " "] # 分割する文字の優先順位
         )
@@ -132,7 +133,78 @@ class RAGEngine:
             "chat_history": chat_history
             })
         return response["answer"]
+    
+    def generate_flashcard(self, db_path):
+        db = Chroma(persist_directory=db_path, embedding_function=self.embeddings)
 
+        retriever = db.as_retriever(search_kwargs={"k": 80})
+
+        create_json_system_prompt = """あなたは優秀な教材作成アシスタントです。
+        以下の参考情報の中から、テストに出題されそうな重要な専門用語を可能な限りたくさん抽出し、"用語": "意味"の組み合わせでJSON出力してください。
+        また、具体的な定義が提供されていない場合、文脈に基づいた一般的な定義を想定してください。
+        出力例{{
+        "人工知能": "人間の知覚や知性を人工的に再現したもの"
+        "機械学習": "データからパターンを学習させる技術"
+        "用語": "意味"
+        }}
+        
+        参考情報:
+        {context}"""
+
+        create_csv_system_prompt = """あなたはCSV変換を行うアシスタントです。
+        以下のJSONの単語をCSV形式に変換して出力してください。その際、日本語以外の言語は日本語に変換してください。
+        出力例{{
+        "人工知能","人間の知覚や知性を人工的に再現したもの"
+        "機械学習","データからパターンを学習させる技術"
+        "用語","意味"
+        }} 
+        【変換元データ】
+        {json_response}
+        """
+
+        create_json_prompt = ChatPromptTemplate.from_messages([
+            ("system", create_json_system_prompt),
+            ("human", "重要な専門用語やキーワードを抽出してJSON形式で出力してください。"),
+        ])
+
+        create_csv_prompt = ChatPromptTemplate.from_messages([
+            ("system", create_csv_system_prompt),
+            ("human", "渡されたJSONをCSVに変換してください。")
+        ])
+
+        json_chain = create_stuff_documents_chain(self.llm, create_json_prompt)
+        json_rag_chain = create_retrieval_chain(retriever, json_chain)
+
+        json_response = json_rag_chain.invoke({
+            "input": "重要な専門用語をやキーワード抽出してJSON形式で出力してください。",
+        })
+        
+        csv_chain = create_csv_prompt | self.llm | StrOutputParser()
+
+        csv_response = csv_chain.invoke({
+            "input": "渡されたJSONをCSVに変換してください。",
+            "json_response": json_response.get("answer", "")
+        })
+        
+        cleaned_lines = []
+        for line in csv_response.split('\n'):
+            line = line.strip()
+            
+            ingnore = ["```", "---"]
+
+            # 空行, AIが書きがちなマークダウン記号を無視
+            if not line or "```" in line or "---" in line:
+                continue
+                
+            #「用語」と「意味」という文字が両方含まれている行は、ヘッダーとみなして捨てる
+            if "用語" in line and "意味" in line:
+                continue
+                
+            # 問題ないデータ行だけを追加
+            cleaned_lines.append(line)
+            
+        # 綺麗な状態のテキストを改行で繋いで返す
+        return "\n".join(cleaned_lines)
 
 # 履歴マネージャー (JSONファイルの読み書き)
 class HistoryManager:
@@ -221,16 +293,50 @@ if __name__ == "__main__":
         st.session_state["history"] = {}
     if "current_db" not in st.session_state:
         st.session_state["current_db"] = ""
+    if "flashcard_csv" not in st.session_state:
+        st.session_state["flashcard_csv"] = None
         
     # サイドバー
     with st.sidebar:
-        st.title("LocalNote")
+        st.title("📒LocalNote")
 
         # メニュー
         app_mode = st.radio("メニュー", ["💭チャット画面", "⚙️設定画面"])
         st.markdown("---")
 
-        st.header("チャットの管理・作成")
+        if st.session_state["db_ready"]:
+            st.subheader("📝 単語帳データの出力")
+            db_name = os.path.basename(st.session_state["current_db"])
+            
+            if st.button("単語帳データを生成"):
+                with st.spinner(f"AIが用語を抽出中...\n(数分かかることがあります)"):
+                    try:
+                        # 抽出の実行
+                        st.session_state["flashcard_csv"] = st.session_state["rag_engine"].generate_flashcard(
+                            st.session_state["current_db"]
+                        )
+                        
+                        st.success(f"✅ ファイルを作成しました！")
+                    except Exception as e:
+                        st.error(f"生成中にエラーが発生しました: {e}")
+            
+            # 生成されたデータがあればダウンロード可
+            if st.session_state["flashcard_csv"] is not None:
+                csv_bytes = st.session_state["flashcard_csv"].encode("utf-8-sig")
+                st.download_button(
+                    label="📥 CSVファイルをダウンロード",
+                    data=csv_bytes,
+                    file_name=f"flashcards_{db_name}.csv",
+                    mime="text/csv"
+                )
+                st.session_state["flashcard_csv"] = None
+
+        else:
+            st.info("チャットを読み込むと生成できるようになります。")
+
+        st.markdown("---")
+
+        st.header("📖チャットの管理・作成")
         existing_db = [i for i in os.listdir(DB_DIR) if os.path.isdir(os.path.join(DB_DIR, i))]
         db_mode = st.radio("操作の選択", ["既存チャットの読み込み", "新規チャットの作成"], index=0)
         
@@ -244,6 +350,7 @@ if __name__ == "__main__":
                     st.session_state["current_db"] = target_db_path
                     
                     st.session_state["history"] = st.session_state["history_manager"].load(selected_db)
+                    st.rerun()
                     st.success(f"✅[{selected_db}]を読み込みました!")
             else:
                 st.warning("既存のチャットがありません。'新規チャットの作成'から作成してください。")
@@ -256,28 +363,22 @@ if __name__ == "__main__":
             
             if st.button("作成して実行する"):
                 if files and new_db_name:
-                    progress_bar = st.progress(0, text="ファイルを保存しています")
-                    save_dir = os.path.join(PDF_DIR, new_db_name)
-                    os.makedirs(save_dir, exist_ok=True)
-                
-                    for i, file in enumerate(files):
-                        file_path = os.path.join(save_dir, file.name)
-                        with open(file_path, "wb") as f:
-                            f.write(file.getbuffer())
-                        progress_bar.progress(int((i + 1) / len(files) * 100), text="ファイルを保存しています")
-                    progress_bar.empty()
-
-                
-                    st.session_state["history"] = {}
+                    with st.spinner("実行中..."):
+                        save_dir = os.path.join(PDF_DIR, new_db_name)
+                        os.makedirs(save_dir, exist_ok=True)
                     
-                    progress_bar = st.progress(0, text="データベースの構築中")
-                    st.session_state["rag_engine"].build_database(save_dir, target_db_path)
-                    progress_bar.progress(100, text="構築完了")
+                        for i, file in enumerate(files):
+                            file_path = os.path.join(save_dir, file.name)
+                            with open(file_path, "wb") as f:
+                                f.write(file.getbuffer())
                     
-                    st.session_state["db_ready"] = True
-                    st.session_state["current_db"] = target_db_path
-                    st.success("✅データベースの構築が完了しました！")
-                    progress_bar.empty()
+                        st.session_state["history"] = {}
+                        
+                        st.session_state["rag_engine"].build_database(save_dir, target_db_path)
+                        
+                        st.session_state["db_ready"] = True
+                        st.session_state["current_db"] = target_db_path
+                        st.success("✅データベースの構築が完了しました！")
 
     # チャット画面
     if app_mode == "💭チャット画面":
