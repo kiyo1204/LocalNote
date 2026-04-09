@@ -152,7 +152,7 @@ class RAGEngine:
         {context}"""
 
         create_csv_system_prompt = """あなたはCSV変換を行うアシスタントです。
-        以下のJSONの単語をCSV形式に変換して出力してください。その際、日本語以外の言語は日本語に変換してください。
+        以下のJSONの単語を2列のCSV形式に変換して出力してください。その際、日本語以外の言語は日本語に変換してください。
         出力例{{
         "人工知能","人間の知覚や知性を人工的に再現したもの"
         "機械学習","データからパターンを学習させる技術"
@@ -169,7 +169,7 @@ class RAGEngine:
 
         create_csv_prompt = ChatPromptTemplate.from_messages([
             ("system", create_csv_system_prompt),
-            ("human", "渡されたJSONをCSVに変換してください。")
+            ("human", "渡されたJSONを2列のCSVに変換してください。")
         ])
 
         json_chain = create_stuff_documents_chain(self.llm, create_json_prompt)
@@ -182,15 +182,13 @@ class RAGEngine:
         csv_chain = create_csv_prompt | self.llm | StrOutputParser()
 
         csv_response = csv_chain.invoke({
-            "input": "渡されたJSONをCSVに変換してください。",
+            "input": "渡されたJSONを2列のCSVに変換してください。",
             "json_response": json_response.get("answer", "")
         })
         
         cleaned_lines = []
         for line in csv_response.split('\n'):
             line = line.strip()
-            
-            ingnore = ["```", "---"]
 
             # 空行, AIが書きがちなマークダウン記号を無視
             if not line or "```" in line or "---" in line:
