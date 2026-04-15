@@ -41,17 +41,27 @@ DEFAULT_PROMPT = """
 """
 
 # コンテキスト内学習用jsonの読み込み
-def load_config():
+def load_config(mode="config"):
     if os.path.exists(CONFIG_DIR):
         with open(CONFIG_DIR, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return DEFAULT_PROMPT
+            data = json.load(f)
+            if mode == "config":
+                return data["config"]
+            else:
+                return data["model"]
+    if mode == "config":
+        return DEFAULT_PROMPT
+    else:
+        return "gemma4:e4b"
 
 # コンテキスト内学習用jsonの保存
-def save_config(config_data):
+def save_config(config_data, model_name):
+    data = {
+        "config": config_data,
+        "model": model_name
+        }
     with open(CONFIG_DIR, "w", encoding="utf-8") as f:
-        json.dump(config_data, f, indent=4, ensure_ascii=False)
-
+        json.dump(data, f, indent=4, ensure_ascii=False)
 
 # RAGエンジン (AIの頭脳とデータベース操作)
 class RAGEngine:
@@ -98,7 +108,7 @@ class RAGEngine:
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=600, # チャンクの最大文字数
             chunk_overlap=50, # チャンク間の重複させる文字数
-            separators=["\n\n", "\n", "。", "、", " "] # 分割する文字の優先順位
+            separators=["\n\n", "\n", "。", ". ", ", ", "、", " "] # 分割する文字の優先順位
         )
         chunks = text_splitter.split_documents(pages)
 
@@ -278,7 +288,7 @@ def delete_chat(db_name, history_name):
 if __name__ == "__main__":
     # 状態の初期化・設定
     if "model_name" not in st.session_state:
-        st.session_state["model_name"] = "gemma4:e4b"
+        st.session_state["model_name"] = load_config(mode="model")
     if "config" not in st.session_state:
         st.session_state["config"] = load_config()
     if "rag_engine" not in st.session_state:
@@ -302,8 +312,8 @@ if __name__ == "__main__":
         app_mode = st.radio("メニュー", ["💭チャット画面", "⚙️設定画面"])
         st.markdown("---")
 
+        st.subheader("📝 単語帳データの出力")
         if st.session_state["db_ready"]:
-            st.subheader("📝 単語帳データの出力")
             db_name = os.path.basename(st.session_state["current_db"])
             
             if st.button("単語帳データを生成"):
@@ -432,7 +442,7 @@ if __name__ == "__main__":
             model_name = st.text_input("モデル名を入力してください。")
 
         # コンテキスト内学習設定
-        st.subheader("🤖コンテキスト内学習グ設定")
+        st.subheader("🤖コンテキスト内学習設定")
         st.markdown("AIへ行う事前の指示を変更できます。")
         new_prompt = st.text_input(
             "現在のプロンプト",
@@ -441,8 +451,8 @@ if __name__ == "__main__":
 
         if st.button("保存"):
             st.session_state["config"] = new_prompt
-            save_config(new_prompt)
             st.session_state["model_name"] = model_name
+            save_config(new_prompt, model_name)
             st.session_state["rag_engine"].update_prompt(new_prompt)
         st.markdown("---")
 

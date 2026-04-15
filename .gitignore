@@ -2,4 +2,5 @@
 db
 history
 upload_files
-start.bat
+.venv
+config.json
