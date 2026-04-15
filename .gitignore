@@ -2,5 +2,5 @@
 db
 history
 upload_files
-config.json
 .venv
+config.json
