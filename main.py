@@ -8,6 +8,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.output_parsers import StrOutputParser
+from markitdown import MarkItDown
 
 import os, logging, json, shutil, gc, time, chromadb
 import streamlit as st
@@ -98,15 +99,19 @@ class RAGEngine:
 
     # PDFを読み込み、分割してベクトルデータベースを構築する
     def build_database(self, pdf_dir_path, target_db_path):
-        loader = DirectoryLoader(
-            pdf_dir_path,
-            glob="**/*.pdf",
-            loader_cls=PDFPlumberLoader
-        )
-        pages = loader.load()
+        progress = st.progress(0, text="ファイル読み込み中")
+        markitdown = MarkItDown()
+        num_file = len(os.scandir(pdf_dir_path))
+
+        pages = []
+
+        for file in os.listdir(pdf_dir_path):
+            markdown = markitdown.convert(file)
+            pages.append(markdown.text_content) 
+            progress.progress((i+1) // num_file, text="ファイル読み込み中")
         
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=600, # チャンクの最大文字数
+            chunk_size=400, # チャンクの最大文字数
             chunk_overlap=50, # チャンク間の重複させる文字数
             separators=["\n\n", "\n", "。", ". ", ", ", "、", " "] # 分割する文字の優先順位
         )
@@ -116,6 +121,34 @@ class RAGEngine:
             Chroma.from_documents(documents=chunks, embedding=self.embeddings, persist_directory=target_db_path)
         else:
             Chroma(persist_directory=target_db_path, embedding_function=self.embeddings)
+
+    def add_database(self, add_dir_path, target_db_path):
+        progress = st.progress(0, text="追加ファイルの読み込み中")
+        markitdown = MarkItDown()
+        files = os.listdir(add_dir_path)
+
+        pages = []
+
+        for i, file in enumerate(files):
+            if file[-2:] != "md":
+                markdown = markitdown.convert(file)
+                text = markdown.text_content
+            else:
+                text = file
+            pages.append(text) 
+            progress.progress((i+1) // len(files), text="追加ファイルの読み込み中")
+        
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=400, # チャンクの最大文字数
+            chunk_overlap=50, # チャンク間の重複させる文字数
+            separators=["\n\n", "\n", "。", ". ", ", ", "、", " "] # 分割する文字の優先順位
+        )
+        chunks = text_splitter.split_documents(pages)
+
+        db = Chroma(persist_directory=target_db_path, embedding_function=self.embeddings)
+        db.add_documents(chunks)
+
+        gc.collect()
 
     # 指定されたデータベースを検索し、LLMに回答を生成させる
     def ask(self, db_path, query, history_data):
@@ -367,7 +400,7 @@ if __name__ == "__main__":
             if new_db_name:
                 target_db_path = os.path.join(DB_DIR, new_db_name)
 
-            files = st.file_uploader("まとめたいファイルのアップロード", accept_multiple_files=True, type="pdf")
+            files = st.file_uploader("まとめたいファイルのアップロード", accept_multiple_files=True, type=["pdf", "md"])
             
             if st.button("作成して実行する"):
                 if files and new_db_name:
@@ -387,6 +420,31 @@ if __name__ == "__main__":
                         st.session_state["db_ready"] = True
                         st.session_state["current_db"] = target_db_path
                         st.success("✅データベースの構築が完了しました！")
+        st.markdown("---")
+        st.header("学習データの追加")
+        if st.session_state["db_ready"]:
+            db = target_db_path
+            files = st.file_uploader("追加したいデータをアップロード", accept_multiple_files=True)
+            if st.button("追加の実行"):
+                temp_file_dir = os.path.join(PDF_DIR, "temp")
+                os.makedirs(temp_file_dir, exist_ok=True)
+
+                for i, file in enumerate(files):
+                    with open(os.path.join(temp_file_dir, file.name), "wb") as f:
+                        f.write(file.getbuffer())
+
+                with st.spinner("追加資料を解析中..."):
+                    st.session_state["rag_engine"].add_database(temp_file_dir, target_db_path)
+
+                    final_file_dir = os.path.join(PDF_DIR, selected_db)
+                    for file_name in os.listdir(temp_file_dir):
+                        shutil.move(os.path.join(temp_file_dir, file.name), os.path.join(final_file_dir, file_name))
+
+                        shutil.rmtree(temp_file_dir)
+                        st.success("✅ファイルの追加が完了しました")
+        else:
+            st.info("追加を行うにはまずチャットの選択・作成を行ってください")
+
 
     # チャット画面
     if app_mode == "💭チャット画面":
