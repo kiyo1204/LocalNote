@@ -14,6 +14,7 @@
 - **フロントエンド**: Streamlit
 - **バックエンド**: Python, LangChain
 - **ローカルLLM**: Gemma4
+- **RAG**: 
 
 >**LangChainとは**:<br>
 　LangChainはLLMのモデルを実用的なアプリに組み込むためのツールで, LLM専用の統合管理フレームワークです.

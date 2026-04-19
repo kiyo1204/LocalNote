@@ -4,12 +4,13 @@ from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_classic.chains import create_retrieval_chain, create_history_aware_retriever
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage, AIMessage
-from langchain_core.output_parsers import StrOutputParser
+from markitdown import MarkItDown
 
-import os, logging, json, shutil, gc, time, chromadb
+import os, logging, json, shutil, gc, time, chromadb, re
 import streamlit as st
 
 
@@ -68,10 +69,14 @@ class RAGEngine:
     def __init__(self, system_prompt):
         # アプリ起動時に一度だけモデルをロードして保持する
         self.embeddings = HuggingFaceEmbeddings(
-            model_name="intfloat/multilingual-e5-small",
+            model_name="intfloat/multilingual-e5-base",
             model_kwargs={"device": "cpu"}
         )
-        self.llm = ChatOllama(model=st.session_state["model_name"], temperature=0)
+        self.llm = ChatOllama(
+            model=st.session_state["model_name"],
+            temperature=0,
+            num_predict=4096
+            )
 
         # 質問再構築用プロンプト
         contextualize_q_system_prompt = """これまでのチャット履歴と、最新のユーザーの質問を受け取ります。
@@ -96,19 +101,38 @@ class RAGEngine:
         # モデル設定
         self.llm = ChatOllama(model=st.session_state["model_name"], temperature=0)
 
-    # PDFを読み込み、分割してベクトルデータベースを構築する
-    def build_database(self, pdf_dir_path, target_db_path):
-        loader = DirectoryLoader(
-            pdf_dir_path,
-            glob="**/*.pdf",
-            loader_cls=PDFPlumberLoader
-        )
-        pages = loader.load()
+    # Markdownに変換
+    def _load_documents(self, dir_path):
+        md = MarkItDown()
+        docs = []
+        
+        # フォルダ内のファイルを順番に処理
+        for root, _, files in os.walk(dir_path):
+            for file in files:
+                file_path = os.path.join(root, file)
+                try:
+                    # MarkItDownでファイルをマークダウンテキストに変換
+                    result = md.convert(file_path)
+                    
+                    doc = Document(
+                        page_content=result.text_content, 
+                        metadata={"source": file_path}
+                    )
+                    docs.append(doc)
+                except Exception as e:
+                    # 変換できない隠しファイルなどはスキップ
+                    print(f"変換スキップ: {file_name} ({e})")
+                    
+        return docs
+
+    # 新規データベースの構築
+    def build_database(self, dir_path, target_db_path):
+        pages = self._load_documents(dir_path)
         
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=600, # チャンクの最大文字数
-            chunk_overlap=50, # チャンク間の重複させる文字数
-            separators=["\n\n", "\n", "。", ". ", ", ", "、", " "] # 分割する文字の優先順位
+            chunk_size=500,
+            chunk_overlap=50,
+            separators=["\n\n", "\n", "# ", "## ", "。", "、", " "]
         )
         chunks = text_splitter.split_documents(pages)
 
@@ -116,6 +140,21 @@ class RAGEngine:
             Chroma.from_documents(documents=chunks, embedding=self.embeddings, persist_directory=target_db_path)
         else:
             Chroma(persist_directory=target_db_path, embedding_function=self.embeddings)
+
+    # 既存データベースへのファイル追加
+    def add_to_database(self, new_dir_path, target_db_path):
+        pages = self._load_documents(new_dir_path)
+        
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=500,
+            chunk_overlap=50,
+            separators=["\n\n", "\n", "# ", "## ", "。", "、", " "]
+        )
+        chunks = text_splitter.split_documents(pages)
+
+        db = Chroma(persist_directory=target_db_path, embedding_function=self.embeddings)
+        db.add_documents(chunks)
+        gc.collect()
 
     # 指定されたデータベースを検索し、LLMに回答を生成させる
     def ask(self, db_path, query, history_data):
@@ -144,75 +183,107 @@ class RAGEngine:
             })
         return response["answer"]
     
+    
     def generate_flashcard(self, db_path):
         db = Chroma(persist_directory=db_path, embedding_function=self.embeddings)
+        retriever = db.as_retriever(search_kwargs={"k": 20})
 
-        retriever = db.as_retriever(search_kwargs={"k": 80})
-
+        # JSON生成用プロンプト
         create_json_system_prompt = """あなたは優秀な教材作成アシスタントです。
-        以下の参考情報の中から、テストに出題されそうな重要な専門用語を可能な限りたくさん抽出し、"用語": "意味"の組み合わせでJSON出力してください。
-        また、具体的な定義が提供されていない場合、文脈に基づいた一般的な定義を想定してください。
-        出力例{{
-        "人工知能": "人間の知覚や知性を人工的に再現したもの"
-        "機械学習": "データからパターンを学習させる技術"
-        "用語": "意味"
-        }}
-        
-        参考情報:
-        {context}"""
 
-        create_csv_system_prompt = """あなたはCSV変換を行うアシスタントです。
-        以下のJSONの単語を2列のCSV形式に変換して出力してください。その際、日本語以外の言語は日本語に変換してください。
-        出力例{{
-        "人工知能","人間の知覚や知性を人工的に再現したもの"
-        "機械学習","データからパターンを学習させる技術"
-        "用語","意味"
-        }} 
-        【変換元データ】
-        {json_response}
+        以下の参考情報から、重要な専門用語を抽出してください。
+
+        【出力形式の厳密な制約】
+        - 出力はJSONオブジェクトのみ
+        - 説明文・Markdownは禁止
+        - 以下の形式を必ず守ること
+
+        {{
+        "terms": [
+            {{
+            "term": "用語",
+            "definition": "意味"
+            }}
+        ]
+        }}
+
+        - 配列は必須
+        - term / definition 以外のキーは禁止
+
+        参考情報:
+        {context}
         """
+
 
         create_json_prompt = ChatPromptTemplate.from_messages([
             ("system", create_json_system_prompt),
-            ("human", "重要な専門用語やキーワードを抽出してJSON形式で出力してください。"),
+            ("human", "重要な専門用語をJSON形式でできるだけたくさん抽出してください。この時に制約を厳守してください"),
         ])
 
-        create_csv_prompt = ChatPromptTemplate.from_messages([
-            ("system", create_csv_system_prompt),
-            ("human", "渡されたJSONを2列のCSVに変換してください。")
-        ])
-
+        # JSON生成（RAG）
         json_chain = create_stuff_documents_chain(self.llm, create_json_prompt)
         json_rag_chain = create_retrieval_chain(retriever, json_chain)
 
         json_response = json_rag_chain.invoke({
-            "input": "重要な専門用語をやキーワード抽出してJSON形式で出力してください。",
+            "input": "重要な専門用語をJSON形式でできるだけたくさん出力してください。この時に制約を厳守してください",
         })
-        
-        csv_chain = create_csv_prompt | self.llm | StrOutputParser()
 
-        csv_response = csv_chain.invoke({
-            "input": "渡されたJSONを2列のCSVに変換してください。",
-            "json_response": json_response.get("answer", "")
-        })
         
-        cleaned_lines = []
-        for line in csv_response.split('\n'):
-            line = line.strip()
+        raw_json = json_response.get("answer", "").strip()
 
-            # 空行, AIが書きがちなマークダウン記号を無視
-            if not line or "```" in line or "---" in line:
+        
+        # コードフェンス除去
+        raw_json = re.sub(r"^\s*```(?:json)?\s*", "", raw_json, flags=re.IGNORECASE)
+        raw_json = re.sub(r"\s*```\s*$", "", raw_json).strip()
+
+        # 余分な末尾 } を削除
+        while raw_json.endswith("}") and raw_json.count("{") < raw_json.count("}"):
+            raw_json = raw_json[:-1].rstrip()
+
+        # 余分な末尾 ] を削除
+        while raw_json.endswith("]") and raw_json.count("[") < raw_json.count("]"):
+            raw_json = raw_json[:-1].rstrip()
+
+        # 足りない } を追加
+        while raw_json.count("{") > raw_json.count("}"):
+            raw_json += "}"
+
+        # 足りない ] を追加
+        while raw_json.count("[") > raw_json.count("]"):
+            raw_json += "]"        
+
+        try:
+            parsed = json.loads(raw_json)
+
+        except json.JSONDecodeError as e:
+            raise ValueError(f"JSONのパースに失敗しました:\n{e}\n\n{raw_json}")
+
+        if isinstance(parsed, dict):
+            terms = parsed.get("terms", [])
+        elif isinstance(parsed, list):
+            terms = parsed
+        else:
+            raise ValueError("JSONの形式が不正です")
+
+        # CSV生成
+        csv_lines = []
+
+        for item in terms:
+            term = item.get("term", "").strip()
+            definition = item.get("definition", "").strip()
+
+            if not term or not definition:
                 continue
-                
-            #「用語」と「意味」という文字が両方含まれている行は、ヘッダーとみなして捨てる
-            if "用語" in line and "意味" in line:
-                continue
-                
-            # 問題ないデータ行だけを追加
-            cleaned_lines.append(line)
-            
-        # 綺麗な状態のテキストを改行で繋いで返す
-        return "\n".join(cleaned_lines)
+
+            # CSV破壊対策
+            term = term.replace("\n", " ").replace(",", "、")
+            definition = definition.replace("\n", " ").replace(",", "、")
+
+            csv_lines.append(f"{term},{definition}")
+
+        return "\n".join(csv_lines)
+
+
 
 # 履歴マネージャー (JSONファイルの読み書き)
 class HistoryManager:
@@ -367,7 +438,7 @@ if __name__ == "__main__":
             if new_db_name:
                 target_db_path = os.path.join(DB_DIR, new_db_name)
 
-            files = st.file_uploader("まとめたいファイルのアップロード", accept_multiple_files=True, type="pdf")
+            files = st.file_uploader("まとめたいファイルのアップロード", accept_multiple_files=True, type=["pdf", "md"])
             
             if st.button("作成して実行する"):
                 if files and new_db_name:
@@ -387,6 +458,31 @@ if __name__ == "__main__":
                         st.session_state["db_ready"] = True
                         st.session_state["current_db"] = target_db_path
                         st.success("✅データベースの構築が完了しました！")
+        st.markdown("---")
+        st.header("学習データの追加")
+        if st.session_state["db_ready"]:
+            db = target_db_path
+            files = st.file_uploader("追加したいデータをアップロード", accept_multiple_files=True)
+            if st.button("追加の実行"):
+                temp_file_dir = os.path.join(PDF_DIR, "temp")
+                os.makedirs(temp_file_dir, exist_ok=True)
+
+                for i, file in enumerate(files):
+                    with open(os.path.join(temp_file_dir, file.name), "wb") as f:
+                        f.write(file.getbuffer())
+
+                with st.spinner("追加資料を解析中..."):
+                    st.session_state["rag_engine"].add_to_database(temp_file_dir, db)
+
+                    final_file_dir = os.path.join(PDF_DIR, os.path.basename(st.session_state["current_db"]))
+                    for file_name in os.listdir(temp_file_dir):
+                        shutil.move(os.path.join(temp_file_dir, file.name), os.path.join(final_file_dir, file_name))
+
+                        shutil.rmtree(temp_file_dir)
+                        st.success("✅ファイルの追加が完了しました")
+        else:
+            st.info("追加を行うにはまずチャットの選択・作成を行ってください")
+
 
     # チャット画面
     if app_mode == "💭チャット画面":
