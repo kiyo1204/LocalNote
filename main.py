@@ -438,7 +438,7 @@ if __name__ == "__main__":
             if new_db_name:
                 target_db_path = os.path.join(DB_DIR, new_db_name)
 
-            files = st.file_uploader("まとめたいファイルのアップロード", accept_multiple_files=True, type="pdf")
+            files = st.file_uploader("まとめたいファイルのアップロード", accept_multiple_files=True, type=["pdf", "md"])
             
             if st.button("作成して実行する"):
                 if files and new_db_name:
