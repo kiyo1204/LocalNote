@@ -342,12 +342,12 @@ def delete_chat(db_name, history_name):
             if os.path.exists(db_name):
                 shutil.rmtree(db_name, ignore_errors=True)
             if os.path.exists(history_name):
-                shutil.rmtree(history_name)
+                shutil.rmtree(history_name, ignore_errors=True)
 
             # PDFの削除
             pdf_dir = os.path.join(PDF_DIR, os.path.basename(db_name))
             if os.path.exists(pdf_dir):
-                shutil.rmtree(pdf_dir)
+                shutil.rmtree(pdf_dir, ignore_errors=True)
 
             st.success("削除しました。")
             time.sleep(.5)
