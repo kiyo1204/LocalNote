@@ -69,7 +69,7 @@ class RAGEngine:
     def __init__(self, system_prompt):
         # アプリ起動時に一度だけモデルをロードして保持する
         self.embeddings = HuggingFaceEmbeddings(
-            model_name="intfloat/multilingual-e5-small", # スペックによってはbase
+            model_name="intfloat/multilingual-e5-base", # スペックによってはbase
             model_kwargs={"device": "cpu"}
         )
         self.llm = ChatOllama(
@@ -105,10 +105,12 @@ class RAGEngine:
     def _load_documents(self, dir_path):
         md = MarkItDown()
         docs = []
+        text = "ファイルの変換中..."
+        progress = st.progress(0, text)
         
         # フォルダ内のファイルを順番に処理
         for root, _, files in os.walk(dir_path):
-            for file in files:
+            for i, file in enumerate(files):
                 file_path = os.path.join(root, file)
                 try:
                     if file[-3:] != "pdf":
@@ -124,20 +126,21 @@ class RAGEngine:
                     else:
                         loader = PDFPlumberLoader(file_path)
                         doc = loader.load()
-                        docs.append(doc[0])
+                        docs.extend(doc)
+                    progress.progress((i//len(files)+1)*100, text)
                 except Exception as e:
                     # 変換できない隠しファイルなどはスキップ
                     print(f"変換スキップ: {file_name} ({e})")
-            return docs
+        return docs
 
     # 新規データベースの構築
     def build_database(self, dir_path, target_db_path):
         pages = self._load_documents(dir_path)
         
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=500,
+            chunk_size=300,
             chunk_overlap=30,
-            separators=["\n\n", "\n", "# ", "## ", "。", "、", " "]
+            separators=["\n\n", "\n", "# ", "## ", "。", "、", ". ", ", ", " "]
         )
         chunks = text_splitter.split_documents(pages)
 
@@ -164,7 +167,7 @@ class RAGEngine:
     # 指定されたデータベースを検索し、LLMに回答を生成させる
     def ask(self, db_path, query, history_data):
         db = Chroma(persist_directory=db_path, embedding_function=self.embeddings)
-        retriever = db.as_retriever(search_kwargs={"k": 15})
+        retriever = db.as_retriever(search_kwargs={"k": 20})
 
         # 履歴データをLangchainに読み込ませられるように変換
         chat_history = []
@@ -202,6 +205,7 @@ class RAGEngine:
         - 出力はJSONオブジェクトのみ
         - 説明文・Markdownは禁止
         - 以下の形式を必ず守ること
+        - 指定された個数単語を抽出すること
 
         {{
         "terms": [
@@ -222,7 +226,7 @@ class RAGEngine:
 
         create_json_prompt = ChatPromptTemplate.from_messages([
             ("system", create_json_system_prompt),
-            ("human", "重要な専門用語をJSON形式で抽出してください。この時に制約を厳守してください"),
+            ("human", "重要な専門用語をJSON形式で{num_words}個抽出してください。この時に制約を厳守してください"),
         ])
 
         # JSON生成（RAG）
@@ -230,7 +234,8 @@ class RAGEngine:
         json_rag_chain = create_retrieval_chain(retriever, json_chain)
 
         json_response = json_rag_chain.invoke({
-            "input": "重要な専門用語をJSON形式でできるだけたくさん出力してください。この時に制約を厳守してください"
+            "input": "重要な専門用語をJSON形式で{num_words}個出力してください。この時に制約を厳守してください",
+            "num_words": num_words
         })
         
         raw_json = json_response.get("answer", "").strip()
@@ -365,7 +370,7 @@ if __name__ == "__main__":
     if "model_name" not in st.session_state:
         st.session_state["model_name"] = load_config(mode="model")
     if "config" not in st.session_state:
-        st.session_state["config"] = load_config()
+        st.session_state["config"] = load_config(mode="config")
     if "rag_engine" not in st.session_state:
         st.session_state["rag_engine"] = RAGEngine(st.session_state["config"])
     if "history_manager" not in st.session_state:
@@ -407,10 +412,16 @@ if __name__ == "__main__":
                 st.warning("既存のチャットがありません。'新規チャットの作成'から作成してください。")
         else:
             new_db_name = st.text_input("新しいチャット名を入力")
+            can_exe = True
             if new_db_name:
                 target_db_path = os.path.join(DB_DIR, new_db_name)
+                if os.path.isdir(target_db_path):
+                    st.warning("このチャット名は使用できません。他のチャット名にしてください。")
+                    can_exe = True # 実行不可能かどうか
+                else:
+                    can_exe = False
 
-            files = st.file_uploader("まとめたいファイルのアップロード", accept_multiple_files=True, type=["pdf", "md"])
+            files = st.file_uploader("まとめたいファイルのアップロード", accept_multiple_files=True, type=["pdf", "md", "docx", "xlsx", "pptx"], disabled=can_exe)
             
             if st.button("作成して実行する"):
                 if files and new_db_name:
@@ -433,7 +444,7 @@ if __name__ == "__main__":
         st.markdown("---")
         st.header("学習データの追加")
         if st.session_state["db_ready"]:
-            db = target_db_path
+            db = st.session_state["current_db"]
             files = st.file_uploader("追加したいデータをアップロード", accept_multiple_files=True)
             if st.button("追加の実行"):
                 temp_file_dir = os.path.join(PDF_DIR, "temp")
@@ -523,7 +534,7 @@ if __name__ == "__main__":
                             for char in ans:
                                 dislpay_char += char
                                 placeholder.markdown(dislpay_char)
-                                time.sleep(.05)
+                                time.sleep(.02)
 
                             # 履歴データの作成と追加
                             data = {
