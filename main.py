@@ -69,7 +69,7 @@ class RAGEngine:
     def __init__(self, system_prompt):
         # アプリ起動時に一度だけモデルをロードして保持する
         self.embeddings = HuggingFaceEmbeddings(
-            model_name="intfloat/multilingual-e5-base",
+            model_name="intfloat/multilingual-e5-small", # スペックによってはbase
             model_kwargs={"device": "cpu"}
         )
         self.llm = ChatOllama(
@@ -111,19 +111,24 @@ class RAGEngine:
             for file in files:
                 file_path = os.path.join(root, file)
                 try:
-                    # MarkItDownでファイルをマークダウンテキストに変換
-                    result = md.convert(file_path)
-                    
-                    doc = Document(
-                        page_content=result.text_content, 
-                        metadata={"source": file_path}
-                    )
-                    docs.append(doc)
+                    if file[-3:] != "pdf":
+                        if file[-2:] != "md":
+                            # MarkItDownでファイルをマークダウンテキストに変換
+                            result = md.convert(file_path)
+
+                        doc = Document(
+                            page_content=result.text_content, 
+                            metadata={"source": file_path}
+                        )
+                        docs.append(doc)
+                    else:
+                        loader = PDFPlumberLoader(file_path)
+                        doc = loader.load()
+                        docs.append(doc[0])
                 except Exception as e:
                     # 変換できない隠しファイルなどはスキップ
                     print(f"変換スキップ: {file_name} ({e})")
-                    
-        return docs
+            return docs
 
     # 新規データベースの構築
     def build_database(self, dir_path, target_db_path):
@@ -131,7 +136,7 @@ class RAGEngine:
         
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=500,
-            chunk_overlap=50,
+            chunk_overlap=30,
             separators=["\n\n", "\n", "# ", "## ", "。", "、", " "]
         )
         chunks = text_splitter.split_documents(pages)
@@ -146,8 +151,8 @@ class RAGEngine:
         pages = self._load_documents(new_dir_path)
         
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=500,
-            chunk_overlap=50,
+            chunk_size=300,
+            chunk_overlap=30,
             separators=["\n\n", "\n", "# ", "## ", "。", "、", " "]
         )
         chunks = text_splitter.split_documents(pages)
@@ -159,7 +164,7 @@ class RAGEngine:
     # 指定されたデータベースを検索し、LLMに回答を生成させる
     def ask(self, db_path, query, history_data):
         db = Chroma(persist_directory=db_path, embedding_function=self.embeddings)
-        retriever = db.as_retriever(search_kwargs={"k": 10})
+        retriever = db.as_retriever(search_kwargs={"k": 15})
 
         # 履歴データをLangchainに読み込ませられるように変換
         chat_history = []
@@ -184,7 +189,7 @@ class RAGEngine:
         return response["answer"]
     
     
-    def generate_flashcard(self, db_path):
+    def generate_flashcard(self, db_path, num_words):
         db = Chroma(persist_directory=db_path, embedding_function=self.embeddings)
         retriever = db.as_retriever(search_kwargs={"k": 20})
 
@@ -217,7 +222,7 @@ class RAGEngine:
 
         create_json_prompt = ChatPromptTemplate.from_messages([
             ("system", create_json_system_prompt),
-            ("human", "重要な専門用語をJSON形式でできるだけたくさん抽出してください。この時に制約を厳守してください"),
+            ("human", "重要な専門用語をJSON形式で抽出してください。この時に制約を厳守してください"),
         ])
 
         # JSON生成（RAG）
@@ -225,12 +230,10 @@ class RAGEngine:
         json_rag_chain = create_retrieval_chain(retriever, json_chain)
 
         json_response = json_rag_chain.invoke({
-            "input": "重要な専門用語をJSON形式でできるだけたくさん出力してください。この時に制約を厳守してください",
+            "input": "重要な専門用語をJSON形式でできるだけたくさん出力してください。この時に制約を厳守してください"
         })
-
         
         raw_json = json_response.get("answer", "").strip()
-
         
         # コードフェンス除去
         raw_json = re.sub(r"^\s*```(?:json)?\s*", "", raw_json, flags=re.IGNORECASE)
@@ -339,12 +342,12 @@ def delete_chat(db_name, history_name):
             if os.path.exists(db_name):
                 shutil.rmtree(db_name, ignore_errors=True)
             if os.path.exists(history_name):
-                shutil.rmtree(history_name)
+                shutil.rmtree(history_name, ignore_errors=True)
 
             # PDFの削除
             pdf_dir = os.path.join(PDF_DIR, os.path.basename(db_name))
             if os.path.exists(pdf_dir):
-                shutil.rmtree(pdf_dir)
+                shutil.rmtree(pdf_dir, ignore_errors=True)
 
             st.success("削除しました。")
             time.sleep(.5)
@@ -357,6 +360,7 @@ def delete_chat(db_name, history_name):
 
 # Streamlit UI部分 (フロントエンド)
 if __name__ == "__main__":
+    st.set_page_config(page_title="LocalNote", page_icon=":shark:")
     # 状態の初期化・設定
     if "model_name" not in st.session_state:
         st.session_state["model_name"] = load_config(mode="model")
@@ -381,38 +385,6 @@ if __name__ == "__main__":
 
         # メニュー
         app_mode = st.radio("メニュー", ["💭チャット画面", "⚙️設定画面"])
-        st.markdown("---")
-
-        st.subheader("📝 単語帳データの出力")
-        if st.session_state["db_ready"]:
-            db_name = os.path.basename(st.session_state["current_db"])
-            
-            if st.button("単語帳データを生成"):
-                with st.spinner(f"AIが用語を抽出中...\n(数分かかることがあります)"):
-                    try:
-                        # 抽出の実行
-                        st.session_state["flashcard_csv"] = st.session_state["rag_engine"].generate_flashcard(
-                            st.session_state["current_db"]
-                        )
-                        
-                        st.success(f"✅ ファイルを作成しました！")
-                    except Exception as e:
-                        st.error(f"生成中にエラーが発生しました: {e}")
-            
-            # 生成されたデータがあればダウンロード可
-            if st.session_state["flashcard_csv"] is not None:
-                csv_bytes = st.session_state["flashcard_csv"].encode("utf-8-sig")
-                st.download_button(
-                    label="📥 CSVファイルをダウンロード",
-                    data=csv_bytes,
-                    file_name=f"flashcards_{db_name}.csv",
-                    mime="text/csv"
-                )
-                st.session_state["flashcard_csv"] = None
-
-        else:
-            st.info("チャットを読み込むと生成できるようになります。")
-
         st.markdown("---")
 
         st.header("📖チャットの管理・作成")
@@ -482,6 +454,40 @@ if __name__ == "__main__":
                         st.success("✅ファイルの追加が完了しました")
         else:
             st.info("追加を行うにはまずチャットの選択・作成を行ってください")
+        
+        st.markdown("---")
+        
+        st.subheader("📝 単語帳データの出力")
+        num_words = st.slider("単語の数", min_value=5, max_value=40)
+        if st.session_state["db_ready"]:
+            db_name = os.path.basename(st.session_state["current_db"])
+            
+            if st.button("単語帳データを生成"):
+                with st.spinner(f"AIが用語を抽出中...\n(数分かかることがあります)"):
+                    try:
+                        # 抽出の実行
+                        st.session_state["flashcard_csv"] = st.session_state["rag_engine"].generate_flashcard(
+                            st.session_state["current_db"],
+                            num_words
+                        )
+                        
+                        st.success(f"✅ ファイルを作成しました！")
+                    except Exception as e:
+                        st.error(f"生成中にエラーが発生しました: {e}")
+            
+            # 生成されたデータがあればダウンロード可
+            if st.session_state["flashcard_csv"] is not None:
+                csv_bytes = st.session_state["flashcard_csv"].encode("utf-8-sig")
+                st.download_button(
+                    label="📥 CSVファイルをダウンロード",
+                    data=csv_bytes,
+                    file_name=f"flashcards_{db_name}.csv",
+                    mime="text/csv"
+                )
+                st.session_state["flashcard_csv"] = None
+
+        else:
+            st.info("チャットを読み込むと生成できるようになります。")
 
 
     # チャット画面
@@ -506,13 +512,18 @@ if __name__ == "__main__":
                     
                 with st.chat_message("assistant"):
                     with st.spinner("思考中..."):
+                        dislpay_char = ""
+                        placeholder = st.empty()
                         try:
                             ans = st.session_state["rag_engine"].ask(
                                 st.session_state["current_db"],
                                 user_query,
                                 st.session_state["history"]
                                 )
-                            st.markdown(ans)
+                            for char in ans:
+                                dislpay_char += char
+                                placeholder.markdown(dislpay_char)
+                                time.sleep(.05)
 
                             # 履歴データの作成と追加
                             data = {
