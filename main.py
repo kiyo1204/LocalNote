@@ -69,7 +69,7 @@ class RAGEngine:
     def __init__(self, system_prompt):
         # アプリ起動時に一度だけモデルをロードして保持する
         self.embeddings = HuggingFaceEmbeddings(
-            model_name="intfloat/multilingual-e5-base", # スペックによってはbase
+            model_name="intfloat/multilingual-e5-small", # スペックによってはbase
             model_kwargs={"device": "cpu"}
         )
         self.llm = ChatOllama(
@@ -117,9 +117,13 @@ class RAGEngine:
                         if file[-2:] != "md":
                             # MarkItDownでファイルをマークダウンテキストに変換
                             result = md.convert(file_path)
+                            content = result.text_content
+                        else:
+                            with open(file_path, encoding="utf-8") as f:
+                                content = f.read()
 
                         doc = Document(
-                            page_content=result.text_content, 
+                            page_content=content,
                             metadata={"source": file_path}
                         )
                         docs.append(doc)
@@ -130,7 +134,9 @@ class RAGEngine:
                     progress.progress((i//len(files)+1)*100, text)
                 except Exception as e:
                     # 変換できない隠しファイルなどはスキップ
-                    print(f"変換スキップ: {file_name} ({e})")
+                    st.warning(f"変換スキップ: {file} ({e})")
+        text = "ファイルの変換完了"
+        st.progress(100, text)
         return docs
 
     # 新規データベースの構築
@@ -460,8 +466,7 @@ if __name__ == "__main__":
                     final_file_dir = os.path.join(PDF_DIR, os.path.basename(st.session_state["current_db"]))
                     for file_name in os.listdir(temp_file_dir):
                         shutil.move(os.path.join(temp_file_dir, file.name), os.path.join(final_file_dir, file_name))
-
-                        shutil.rmtree(temp_file_dir)
+                        shutil.rmtree(temp_file_dir, ignore_errors=True)
                         st.success("✅ファイルの追加が完了しました")
         else:
             st.info("追加を行うにはまずチャットの選択・作成を行ってください")
