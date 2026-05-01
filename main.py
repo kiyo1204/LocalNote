@@ -64,12 +64,30 @@ def save_config(config_data, model_name):
     with open(CONFIG_DIR, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
 
+# パラメータの保存
+def save_rag_params(db_path, chunk_size, chunk_overlap, k):
+    params = {
+        "chunk_size": chunk_size,
+        "chunk_overlap": chunk_overlap,
+        "k": k
+    }
+    with open(os.path.join(db_path, "rag_params.json"), "w", encoding="utf-8") as f:
+        json.dump(params, f, indent=4, ensure_ascii=False)
+
+# パラメータのロード
+def load_rag_params(db_path):
+    param_path = os.path.join(db_path, "rag_params.json")
+    if os.path.exists(param_path):
+        with open(param_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return None
+
 # RAGエンジン (AIの頭脳とデータベース操作)
 class RAGEngine:
     def __init__(self, system_prompt):
         # アプリ起動時に一度だけモデルをロードして保持する
         self.embeddings = HuggingFaceEmbeddings(
-            model_name="intfloat/multilingual-e5-small", # スペックによってはbase
+            model_name="intfloat/multilingual-e5-base", # スペックによってはbase
             model_kwargs={"device": "cpu"}
         )
         self.llm = ChatOllama(
@@ -129,39 +147,43 @@ class RAGEngine:
                         docs.append(doc)
                     else:
                         loader = PDFPlumberLoader(file_path)
-                        doc = loader.load()
-                        docs.extend(doc)
-                    progress.progress((i//len(files)+1)*100, text)
+                        for d in loader.load():
+                            d.metadata["source"] = file_path
+                            docs.append(d)
+
+                    progress.progress(int((i + 1) / len(files) * 100), text)
                 except Exception as e:
                     # 変換できない隠しファイルなどはスキップ
                     st.warning(f"変換スキップ: {file} ({e})")
-        text = "ファイルの変換完了"
-        st.progress(100, text)
+        st.success("ファイルの変換完了")
         return docs
 
     # 新規データベースの構築
-    def build_database(self, dir_path, target_db_path):
+    def build_database(self, dir_path, target_db_path, chunk_size, chunk_overlap, k):
         pages = self._load_documents(dir_path)
-        
+        self.k = k
+
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=300,
-            chunk_overlap=30,
-            separators=["\n\n", "\n", "# ", "## ", "。", "、", ". ", ", ", " "]
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            separators=["\n\n", "\n", "# ", "## ", "。", "、", " "]
         )
         chunks = text_splitter.split_documents(pages)
 
         if not os.path.exists(target_db_path) or not os.listdir(target_db_path):
-            Chroma.from_documents(documents=chunks, embedding=self.embeddings, persist_directory=target_db_path)
-        else:
-            Chroma(persist_directory=target_db_path, embedding_function=self.embeddings)
+            Chroma.from_documents(
+                documents=chunks,
+                embedding=self.embeddings,
+                persist_directory=target_db_path
+            )
 
     # 既存データベースへのファイル追加
-    def add_to_database(self, new_dir_path, target_db_path):
+    def add_to_database(self, new_dir_path, target_db_path, chunk_size, chunk_overlap):
         pages = self._load_documents(new_dir_path)
-        
+
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=300,
-            chunk_overlap=30,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
             separators=["\n\n", "\n", "# ", "## ", "。", "、", " "]
         )
         chunks = text_splitter.split_documents(pages)
@@ -173,31 +195,49 @@ class RAGEngine:
     # 指定されたデータベースを検索し、LLMに回答を生成させる
     def ask(self, db_path, query, history_data):
         db = Chroma(persist_directory=db_path, embedding_function=self.embeddings)
-        retriever = db.as_retriever(search_kwargs={"k": 20})
 
-        # 履歴データをLangchainに読み込ませられるように変換
+        k = getattr(self, "k", 6)
+        retriever = db.as_retriever(search_kwargs={"k": k})
+
         chat_history = []
-        if history_data:
-            for key, exchange in history_data.items():
-                chat_history.append(HumanMessage(content=exchange["input"]["content"]))
-                chat_history.append(AIMessage(content=exchange["output"]["content"]))
+        if history_data and isinstance(history_data, dict):
+            for exchange in history_data.values():
+                if (
+                    isinstance(exchange, dict)
+                    and "input" in exchange
+                    and "output" in exchange
+                ):
+                    chat_history.append(
+                        HumanMessage(content=exchange["input"].get("content", ""))
+                    )
+                    chat_history.append(
+                        AIMessage(content=exchange["output"].get("content", ""))
+                    )
 
-        # 履歴を考慮してデータベースを検索するRetriever
         history_aware_retriever = create_history_aware_retriever(
             self.llm, retriever, self.contextualize_q_prompt
         )
 
-        # 回答生成チェーン
         question_answer_chain = create_stuff_documents_chain(self.llm, self.prompt)
         rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
-        
+
         response = rag_chain.invoke({
             "input": query,
             "chat_history": chat_history
-            })
-        return response["answer"]
+        })
+
+        used_sources = {
+            os.path.basename(doc.metadata.get("source", ""))
+            for doc in response.get("context", [])
+            if isinstance(doc.metadata, dict)
+        }
+
+        return {
+            "answer": response["answer"],
+            "sources": sorted(used_sources)
+        }
     
-    
+    # 単語帳リストの生成
     def generate_flashcard(self, db_path, num_words):
         db = Chroma(persist_directory=db_path, embedding_function=self.embeddings)
         retriever = db.as_retriever(search_kwargs={"k": 20})
@@ -209,18 +249,18 @@ class RAGEngine:
 
         【出力形式の厳密な制約】
         - 出力はJSONオブジェクトのみ
-        - 説明文・Markdownは禁止
+        - 説明文・Markdown, latexは禁止
         - 以下の形式を必ず守ること
         - 指定された個数単語を抽出すること
+        - 単語は日本語で, JSON以外を出力しない
 
-        {{
+        【出力形式】
         "terms": [
             {{
             "term": "用語",
             "definition": "意味"
             }}
         ]
-        }}
 
         - 配列は必須
         - term / definition 以外のキーは禁止
@@ -296,8 +336,48 @@ class RAGEngine:
             csv_lines.append(f"{term},{definition}")
 
         return "\n".join(csv_lines)
+    
+    # 複数ファイル由来のベクトルをDBから削除
+    def delete_files_from_database(self, db_path, target_file_paths: list[str]):
+        db = Chroma(
+            persist_directory=db_path,
+            embedding_function=self.embeddings
+        )
 
+        for path in target_file_paths:
+            db._collection.delete(
+                where={"source": path}
+            )
 
+        gc.collect()
+
+    # 資料の文字数推定
+    def estimate_total_chars(self, dir_path):
+        total_chars = 0
+        md = MarkItDown()
+
+        for root, _, files in os.walk(dir_path):
+            for file in files:
+                file_path = os.path.join(root, file)
+
+                try:
+                    if file.lower().endswith(".pdf"):
+                        loader = PDFPlumberLoader(file_path)
+                        pages = loader.load()
+                        total_chars += sum(len(p.page_content) for p in pages)
+
+                    elif file.lower().endswith(".md"):
+                        with open(file_path, encoding="utf-8") as f:
+                            total_chars += len(f.read())
+
+                    else:
+                        result = md.convert(file_path)
+                        total_chars += len(result.text_content)
+
+                except Exception:
+                    continue
+
+        return total_chars
 
 # 履歴マネージャー (JSONファイルの読み書き)
 class HistoryManager:
@@ -369,6 +449,24 @@ def delete_chat(db_name, history_name):
     if col2.button("いいえ"):
         st.rerun()
 
+# パラメータの自動決定
+def auto_rag_params(total_chars: int):
+    if total_chars < 10_000:
+        chunk_size = 500
+        k = 12
+    elif total_chars < 50_000:
+        chunk_size = 800
+        k = 8
+    elif total_chars < 200_000:
+        chunk_size = 1000
+        k = 6
+    else:
+        chunk_size = 1200
+        k = 4
+
+    chunk_overlap = int(chunk_size * 0.15)
+    return chunk_size, chunk_overlap, k
+
 # Streamlit UI部分 (フロントエンド)
 if __name__ == "__main__":
     st.set_page_config(page_title="LocalNote", page_icon=":shark:")
@@ -396,60 +494,11 @@ if __name__ == "__main__":
 
         # メニュー
         app_mode = st.radio("メニュー", ["💭チャット画面", "⚙️設定画面"])
-        st.markdown("---")
 
-        st.header("📖チャットの管理・作成")
-        existing_db = [i for i in os.listdir(DB_DIR) if os.path.isdir(os.path.join(DB_DIR, i))]
-        db_mode = st.radio("操作の選択", ["既存チャットの読み込み", "新規チャットの作成"], index=0)
-        
-        if db_mode == "既存チャットの読み込み":
-            if existing_db:
-                selected_db = st.selectbox("使用チャットの選択", existing_db)
-                target_db_path = os.path.join(DB_DIR, selected_db)
-
-                if st.button("開始"):
-                    st.session_state["db_ready"] = True
-                    st.session_state["current_db"] = target_db_path
-                    
-                    st.session_state["history"] = st.session_state["history_manager"].load(selected_db)
-                    st.rerun()
-                    st.success(f"✅[{selected_db}]を読み込みました!")
-            else:
-                st.warning("既存のチャットがありません。'新規チャットの作成'から作成してください。")
-        else:
-            new_db_name = st.text_input("新しいチャット名を入力")
-            can_exe = True
-            if new_db_name:
-                target_db_path = os.path.join(DB_DIR, new_db_name)
-                if os.path.isdir(target_db_path):
-                    st.warning("このチャット名は使用できません。他のチャット名にしてください。")
-                    can_exe = True # 実行不可能かどうか
-                else:
-                    can_exe = False
-
-            files = st.file_uploader("まとめたいファイルのアップロード", accept_multiple_files=True, type=["pdf", "md", "docx", "xlsx", "pptx"], disabled=can_exe)
-            
-            if st.button("作成して実行する"):
-                if files and new_db_name:
-                    with st.spinner("実行中..."):
-                        save_dir = os.path.join(PDF_DIR, new_db_name)
-                        os.makedirs(save_dir, exist_ok=True)
-                    
-                        for i, file in enumerate(files):
-                            file_path = os.path.join(save_dir, file.name)
-                            with open(file_path, "wb") as f:
-                                f.write(file.getbuffer())
-                    
-                        st.session_state["history"] = {}
-                        
-                        st.session_state["rag_engine"].build_database(save_dir, target_db_path)
-                        
-                        st.session_state["db_ready"] = True
-                        st.session_state["current_db"] = target_db_path
-                        st.success("✅データベースの構築が完了しました！")
-        st.markdown("---")
-        st.header("学習データの追加")
         if st.session_state["db_ready"]:
+            st.markdown("---")
+            st.header("📂 学習ファイル管理")
+            st.subheader("学習ファイルの追加")
             db = st.session_state["current_db"]
             files = st.file_uploader("追加したいデータをアップロード", accept_multiple_files=True)
             if st.button("追加の実行"):
@@ -465,14 +514,66 @@ if __name__ == "__main__":
 
                     final_file_dir = os.path.join(PDF_DIR, os.path.basename(st.session_state["current_db"]))
                     for file_name in os.listdir(temp_file_dir):
-                        shutil.move(os.path.join(temp_file_dir, file.name), os.path.join(final_file_dir, file_name))
-                        shutil.rmtree(temp_file_dir, ignore_errors=True)
-                        st.success("✅ファイルの追加が完了しました")
-        else:
-            st.info("追加を行うにはまずチャットの選択・作成を行ってください")
+                        shutil.move(
+                            os.path.join(temp_file_dir, file_name),
+                            os.path.join(final_file_dir, file_name)
+                        )
+
+                    shutil.rmtree(temp_file_dir, ignore_errors=True)
+
+                    st.success("✅ファイルの追加が完了しました")
+
+            st.subheader("🗂 現在の学習ファイル")
+            db_name = os.path.basename(st.session_state["current_db"])
+            file_dir = os.path.join(PDF_DIR, db_name)
+
+            if os.path.exists(file_dir):
+                files = sorted(os.listdir(file_dir))
+                selected_files = []
+                is_delete_chat = False
+
+                if files:
+                    for file in files:
+                        checked = st.checkbox(file, key=f"del_{db_name}_{file}")
+                        if checked:
+                            selected_files.append(file)
+
+                    if selected_files:
+                        if len(files) == len(selected_files):
+                            is_delete_chat = True
+                            st.warning("すべてのファイルが選択されているため，チャットが削除されます")
+                        else:
+                            st.warning("選択したファイルはデータベースから完全に削除されます")
+
+                        if st.button("❌ 選択したファイルを削除"):
+                            with st.spinner("削除中..."):
+                                if is_delete_chat:
+                                    delete_chat(st.session_state["current_db"], os.path.join(OUTPUT_DIR, db_name))
+                                else:
+                                    full_paths = [
+                                        os.path.join(file_dir, f) for f in selected_files
+                                    ]
+
+                                    # DBから削除
+                                    st.session_state["rag_engine"].delete_files_from_database(
+                                        st.session_state["current_db"],
+                                        full_paths
+                                    )
+
+                                    # 元ファイル削除
+                                    for path in full_paths:
+                                        if os.path.exists(path):
+                                            os.remove(path)
+
+                                    st.success("✅ 選択した学習ファイルを削除しました")
+                                    time.sleep(.5)
+                                    st.rerun()
+                else:
+                    st.info("学習ファイルがありません")
+            else:
+                st.info("学習フォルダが存在しません")
         
         st.markdown("---")
-        
         st.subheader("📝 単語帳データの出力")
         num_words = st.slider("単語の数", min_value=5, max_value=40)
         if st.session_state["db_ready"]:
@@ -505,6 +606,80 @@ if __name__ == "__main__":
         else:
             st.info("チャットを読み込むと生成できるようになります。")
 
+        st.markdown("---")
+        st.header("📖チャットの管理・作成")
+        existing_db = [i for i in os.listdir(DB_DIR) if os.path.isdir(os.path.join(DB_DIR, i))]
+        db_mode = st.radio("操作の選択", ["既存チャットの読み込み", "新規チャットの作成"], index=0)
+        
+        if db_mode == "既存チャットの読み込み":
+            if existing_db:
+                selected_db = st.selectbox("使用チャットの選択", existing_db)
+                target_db_path = os.path.join(DB_DIR, selected_db)
+
+                if st.button("開始"):
+                    st.session_state["db_ready"] = True
+                    st.session_state["current_db"] = target_db_path
+
+                    # RAGパラメータ復元
+                    params = load_rag_params(target_db_path)
+                    if params:
+                        st.session_state["rag_engine"].k = params["k"]
+
+                    st.session_state["history"] = st.session_state["history_manager"].load(selected_db)
+                    st.rerun()
+                    st.success(f"✅[{selected_db}]を読み込みました!")
+            else:
+                st.warning("既存のチャットがありません。'新規チャットの作成'から作成してください。")
+        else:
+            new_db_name = st.text_input("新しいチャット名を入力")
+            can_exe = True
+            if new_db_name:
+                target_db_path = os.path.join(DB_DIR, new_db_name)
+                if os.path.isdir(target_db_path):
+                    st.warning("このチャット名は使用できません。他のチャット名にしてください。")
+                    can_exe = True # 実行不可能かどうか
+                else:
+                    can_exe = False
+
+            files = st.file_uploader("まとめたいファイルのアップロード", accept_multiple_files=True, type=["pdf", "md", "docx", "xlsx", "pptx"], disabled=can_exe)
+            
+            if st.button("作成して実行する"):
+                if files and new_db_name:
+                    with st.spinner("実行中..."):
+                        save_dir = os.path.join(PDF_DIR, new_db_name)
+                        os.makedirs(save_dir, exist_ok=True)
+                    
+                        for i, file in enumerate(files):
+                            file_path = os.path.join(save_dir, file.name)
+                            with open(file_path, "wb") as f:
+                                f.write(file.getbuffer())
+
+                        st.session_state["history"] = {}
+                        
+                        total_chars = st.session_state["rag_engine"].estimate_total_chars(save_dir)
+                        
+                        chunk_size, chunk_overlap, k_value = auto_rag_params(total_chars)
+
+                        # DB構築
+                        st.session_state["rag_engine"].build_database(
+                            save_dir,
+                            target_db_path,
+                            chunk_size,
+                            chunk_overlap,
+                            k_value
+                        )
+
+                        # パラメータ保存
+                        save_rag_params(
+                            target_db_path,
+                            chunk_size,
+                            chunk_overlap,
+                            k_value
+                        )
+                        
+                        st.session_state["db_ready"] = True
+                        st.session_state["current_db"] = target_db_path
+                        st.success("✅データベースの構築が完了しました！")
 
     # チャット画面
     if app_mode == "💭チャット画面":
@@ -531,20 +706,30 @@ if __name__ == "__main__":
                         dislpay_char = ""
                         placeholder = st.empty()
                         try:
-                            ans = st.session_state["rag_engine"].ask(
+                            result = st.session_state["rag_engine"].ask(
                                 st.session_state["current_db"],
                                 user_query,
                                 st.session_state["history"]
-                                )
-                            for char in ans:
+                            )
+
+                            answer = result["answer"]
+                            sources = result["sources"]
+
+                            for char in answer:
                                 dislpay_char += char
                                 placeholder.markdown(dislpay_char)
                                 time.sleep(.02)
 
+                            if sources:
+                                st.markdown("---")
+                                st.markdown("📚 **参考にした資料:**")
+                                for src in sources:
+                                    st.markdown(f"- {src}")
+
                             # 履歴データの作成と追加
                             data = {
                                 "input": {"role": "user", "content": user_query},
-                                "output": {"role": "assistant", "content": ans}
+                                "output": {"role": "assistant", "content": answer}
                             }
                             st.session_state["history"]["question_"+str(len(st.session_state["history"]))] = data
 

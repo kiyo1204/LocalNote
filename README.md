@@ -28,8 +28,9 @@
 
 ## ⚙️機能・特徴
 ### 機能
-- PDFを読み込んでRAG(*Retrieval-Augmented Generation*)を使用したチャット作成します.
+- PDFやMarkdownなどのファイルを読み込んでRAG(*Retrieval-Augmented Generation*)構築し，チャットを作成します.
 - AIがアドバイザーとなり, 要点整理や問題作成などを行います.
+- 資料の追加，削除を行えます．
 
 ### 特徴
 - 1つだけでなく, 複数のチャットの作成が可能です.
