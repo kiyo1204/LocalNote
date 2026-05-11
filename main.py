@@ -66,6 +66,7 @@ def save_config(config_data, model_name):
 
 # パラメータの保存
 def save_rag_params(db_path, chunk_size, chunk_overlap, k):
+    os.makedirs(db_path, exist_ok=True)  # ディレクトリが存在しない場合は作成
     params = {
         "chunk_size": chunk_size,
         "chunk_overlap": chunk_overlap,
@@ -146,10 +147,20 @@ class RAGEngine:
                         )
                         docs.append(doc)
                     else:
-                        loader = PDFPlumberLoader(file_path)
-                        for d in loader.load():
-                            d.metadata["source"] = file_path
-                            docs.append(d)
+                        try:
+                            loader = PDFPlumberLoader(file_path)
+                            loaded_docs = loader.load()
+                            if loaded_docs:
+                                for d in loaded_docs:
+                                    d.metadata["source"] = file_path
+                                    # 空でないドキュメントのみ追加
+                                    if d.page_content.strip():
+                                        docs.append(d)
+                                st.info(f"PDF読込: {file} ({len(loaded_docs)}ページ)")
+                            else:
+                                st.warning(f"PDF読込失敗: {file} (コンテンツなし)")
+                        except Exception as pdf_error:
+                            st.warning(f"PDF処理エラー: {file} ({pdf_error})")
 
                     progress.progress(int((i + 1) / len(files) * 100), text)
                 except Exception as e:
@@ -162,6 +173,12 @@ class RAGEngine:
     def build_database(self, dir_path, target_db_path, chunk_size, chunk_overlap, k):
         pages = self._load_documents(dir_path)
         self.k = k
+        
+        # ドキュメントが読み込まれたか確認
+        st.info(f"読込ドキュメント数: {len(pages)}")
+        if not pages:
+            st.error("読み込むドキュメントがありません")
+            return
 
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size,
@@ -169,6 +186,15 @@ class RAGEngine:
             separators=["\n\n", "\n", "# ", "## ", "。", "、", " "]
         )
         chunks = text_splitter.split_documents(pages)
+        
+        # 確認用
+        # st.write(chunks)
+        
+        # チャンク化の結果を確認
+        st.info(f"生成チャンク数: {len(chunks)}")
+        if not chunks:
+            st.error("チャンク生成に失敗しました")
+            return
 
         if not os.path.exists(target_db_path) or not os.listdir(target_db_path):
             Chroma.from_documents(
@@ -176,10 +202,17 @@ class RAGEngine:
                 embedding=self.embeddings,
                 persist_directory=target_db_path
             )
+            st.success(f"データベース構築完了: {len(chunks)}チャンク")
 
     # 既存データベースへのファイル追加
     def add_to_database(self, new_dir_path, target_db_path, chunk_size, chunk_overlap):
         pages = self._load_documents(new_dir_path)
+        
+        # ドキュメントが読み込まれたか確認
+        st.info(f"読込ドキュメント数: {len(pages)}")
+        if not pages:
+            st.error("読み込むドキュメントがありません")
+            return
 
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size,
@@ -187,9 +220,16 @@ class RAGEngine:
             separators=["\n\n", "\n", "# ", "## ", "。", "、", " "]
         )
         chunks = text_splitter.split_documents(pages)
+        
+        # チャンク化の結果を確認
+        st.info(f"生成チャンク数: {len(chunks)}")
+        if not chunks:
+            st.error("チャンク生成に失敗しました")
+            return
 
         db = Chroma(persist_directory=target_db_path, embedding_function=self.embeddings)
         db.add_documents(chunks)
+        st.success(f"データベース更新完了: {len(chunks)}チャンク追加")
         gc.collect()
 
     # 指定されたデータベースを検索し、LLMに回答を生成させる
@@ -451,20 +491,33 @@ def delete_chat(db_name, history_name):
 
 # パラメータの自動決定
 def auto_rag_params(total_chars: int):
-    if total_chars < 10_000:
+    # 文字数に基づいてチャンクサイズとK値を決定
+    if total_chars < 5_000:
+        # 非常に小規模
+        chunk_size = 300
+        k = 20
+    elif total_chars < 20_000:
+        # 小規模
         chunk_size = 500
-        k = 12
+        k = 18
     elif total_chars < 50_000:
+        # 中規模
         chunk_size = 800
-        k = 8
-    elif total_chars < 200_000:
+        k = 15
+    elif total_chars < 100_000:
+        # 大規模
         chunk_size = 1000
-        k = 6
-    else:
+        k = 10
+    elif total_chars < 300_000:
+        # 超大規模
         chunk_size = 1200
-        k = 4
+        k = 8
+    else:
+        # 極大規模
+        chunk_size = 1500
+        k = 6
 
-    chunk_overlap = int(chunk_size * 0.15)
+    chunk_overlap = int(chunk_size * 0.2)  # 20%のオーバーラップで文脈保持
     return chunk_size, chunk_overlap, k
 
 # Streamlit UI部分 (フロントエンド)
