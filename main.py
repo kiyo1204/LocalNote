@@ -9,6 +9,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage, AIMessage
 from markitdown import MarkItDown
+from coordinate_chunker import CoordinateChunker
 
 import os, logging, json, shutil, gc, time, chromadb, re
 import streamlit as st
@@ -148,17 +149,34 @@ class RAGEngine:
                         docs.append(doc)
                     else:
                         try:
-                            loader = PDFPlumberLoader(file_path)
-                            loaded_docs = loader.load()
-                            if loaded_docs:
-                                for d in loaded_docs:
-                                    d.metadata["source"] = file_path
-                                    # 空でないドキュメントのみ追加
-                                    if d.page_content.strip():
-                                        docs.append(d)
-                                st.info(f"PDF読込: {file} ({len(loaded_docs)}ページ)")
+                            # 座標ベースチャンキングを使用
+                            chunker = CoordinateChunker(eps=15.0, min_chars=3, direction_threshold=0.7)
+                            chunks_info = chunker.create_chunks(file_path, min_chunk_size=20)
+                            
+                            if chunks_info:
+                                for chunk in chunks_info:
+                                    # Chromaがdictメタデータを受け入れられないため、座標を文字列化
+                                    bbox = chunk["bbox"]
+                                    bbox_str = f"x:{bbox['x0']:.1f}-{bbox['x1']:.1f},y:{bbox['y0']:.1f}-{bbox['y1']:.1f}"
+                                    
+                                    doc = Document(
+                                        page_content=chunk["text"],
+                                        metadata={
+                                            "source": file_path,
+                                            "page": chunk["page"],
+                                            "direction": chunk["direction"],
+                                            "bbox": bbox_str,
+                                            "char_count": chunk["char_count"]
+                                        }
+                                    )
+                                    if doc.page_content.strip():
+                                        docs.append(doc)
+                                
+                                stats = chunker.get_chunk_stats(chunks_info)
+                                st.info(f"PDF読込: {file} ({stats['total_chunks']}チャンク | "
+                                        f"横:{stats['horizontal_chunks']} 縦:{stats['vertical_chunks']} 混:{stats['mixed_chunks']})")
                             else:
-                                st.warning(f"PDF読込失敗: {file} (コンテンツなし)")
+                                st.warning(f"PDF読込失敗: {file} (チャンク化失敗)")
                         except Exception as pdf_error:
                             st.warning(f"PDF処理エラー: {file} ({pdf_error})")
 
